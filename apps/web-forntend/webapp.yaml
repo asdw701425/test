@@ -1,0 +1,215 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: appnet
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: web-frontend
+  namespace: appnet
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: web-frontend-reader
+  namespace: appnet
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: web-frontend-reader-binding
+  namespace: appnet
+subjects:
+  - kind: ServiceAccount
+    name: web-frontend
+    namespace: appnet
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: web-frontend-reader
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-frontend
+  namespace: appnet
+  labels:
+    app: web-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web-frontend
+  template:
+    metadata:
+      labels:
+        app: web-frontend
+    spec:
+      serviceAccountName: web-frontend
+      automountServiceAccountToken: true
+      nodeSelector:
+        role: web
+      tolerations:
+        - key: "role"
+          operator: "Equal"
+          value: "web"
+          effect: "NoSchedule"
+      volumes:
+        - name: shared-api-base
+          emptyDir: {}
+      initContainers:
+        - name: init-api-base
+          image: bitnami/kubectl:latest
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SVC_NAME
+              value: "was-api-nlb"
+            - name: OUT_FILE
+              value: "/opt/web-shared/api_base"
+            - name: API_PORT
+              value: "80"
+          volumeMounts:
+            - name: shared-api-base
+              mountPath: /opt/web-shared
+          command: ["/bin/sh", "-lc"]
+          args:
+            - |
+              set -eu
+              OUT_FILE="${OUT_FILE:-/opt/web-shared/api_base}"
+              API_PORT="${API_PORT:-80}"
+              SVC_NAME="${SVC_NAME:-was-api-nlb}"
+              NS="${NAMESPACE:-appnet}"
+              KUBECTL="/opt/bitnami/kubectl/bin/kubectl"; [ -x "$KUBECTL" ] || KUBECTL="kubectl"
+              echo "[init] getting NLB hostname once with ${KUBECTL}..."
+              host="$($KUBECTL -n "$NS" get svc "$SVC_NAME" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+              if [ -n "$host" ]; then
+                echo "http://$host:$API_PORT" > "$OUT_FILE"
+                echo "[init] api_base -> http://$host:$API_PORT"
+              else
+                echo "[init] NLB not ready, fallback to ClusterIP"
+                echo "http://was:8000" > "$OUT_FILE"
+              fi
+      containers:
+        - name: web
+          image: ghcr.io/unklo1200/web-updated:v16
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: API_BASE_FILE
+              value: "/opt/web-shared/api_base"
+          volumeMounts:
+            - name: shared-api-base
+              mountPath: /opt/web-shared
+          startupProbe:
+            exec:
+              command: ["/bin/sh", "-lc", "grep -qE '^https?://' /opt/web-shared/api_base"]
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+        - name: nlb-watcher
+          image: bitnami/kubectl:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SVC_NAME
+              value: "was-api-nlb"
+            - name: OUT_FILE
+              value: "/opt/web-shared/api_base"
+            - name: API_PORT
+              value: "80"
+          volumeMounts:
+            - name: shared-api-base
+              mountPath: /opt/web-shared
+          command: ["/bin/sh", "-lc"]
+          args:
+            - |
+              set -eu
+              KUBECTL="/opt/bitnami/kubectl/bin/kubectl"; [ -x "$KUBECTL" ] || KUBECTL="kubectl"
+              echo "[watcher] starting with ${KUBECTL}"
+              prev=""
+              NS="${NAMESPACE:-appnet}"
+              SVC="${SVC_NAME:-was-api-nlb}"
+              OUT="${OUT_FILE:-/opt/web-shared/api_base}"
+              PORT="${API_PORT:-80}"
+              while true; do
+                out="$($KUBECTL -n "$NS" get svc "$SVC" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>&1 || true)"
+                echo "[watcher] kubectl -> $out"
+                if echo "$out" | grep -Eqi 'forbidden'; then
+                  echo "[watcher] RBAC forbidden. check Role/RoleBinding"
+                  sleep 10
+                  continue
+                fi
+                if [ -n "$out" ] && ! echo "$out" | grep -Eqi 'error|not found'; then
+                  value="http://$out:$PORT"
+                  if [ "$value" != "$prev" ]; then
+                    echo "$value" > "${OUT}.tmp" && mv "${OUT}.tmp" "${OUT}"
+                    echo "[watcher] updated api_base -> $value"
+                    prev="$value"
+                  fi
+                fi
+                sleep 15
+              done
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-frontend
+  namespace: appnet
+spec:
+  selector:
+    app: web-frontend
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web-frontend
+  namespace: appnet
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    alb.ingress.kubernetes.io/subnets: subnet-0232a4e7b6a91ec96,subnet-0742da13e3b45f652,subnet-04c09752e47384a7b
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web-frontend
+                port:
+                  number: 80

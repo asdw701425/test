@@ -1,0 +1,218 @@
+# =========================================
+# 1) Secret (민감 값)
+# =========================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: was-secrets
+  namespace: appnet
+type: Opaque
+stringData:
+  DB_USER: "awslearner"
+  DB_PASS: "awslearner"
+  DB_NAME: "test2"
+  SECRET_KEY: "change-me"     # Flask 세션 키 (원하면 교체)
+  # JWT_SECRET: "change-me"
+
+---
+# =========================================
+# 2) ConfigMap (비민감 값)
+# =========================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: was-config
+  namespace: appnet
+data:
+  DB_HOST: "test.c0feiu04cr8o.us-east-1.rds.amazonaws.com"
+  DB_PORT: "3306"
+  DB_DRIVER: "pymysql"
+  DB_CHARSET: "utf8mb4"
+
+  AWS_REGION: "us-east-1"
+  S3_BUCKET: "soldesk-kim"
+  S3_MODE: "presign"
+
+  # Redis 연결 (ClusterIP: redis)
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"
+
+---
+# =========================================
+# 3) ServiceAccount (IRSA 연결 시 주석 해제)
+# =========================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: was-api
+  namespace: appnet
+  annotations:
+    # eks.amazonaws.com/role-arn: arn:aws:iam::<ACCOUNT_ID>:role/<ROLE_NAME>
+automountServiceAccountToken: true
+
+---
+# =========================================
+# 4) Deployment (gunicorn /tmp 필요 반영 + Redis readyz)
+# =========================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: was-api
+  namespace: appnet
+  labels:
+    app: was-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: was-api
+  template:
+    metadata:
+      labels:
+        app: was-api
+    spec:
+      serviceAccountName: was-api
+      # was 노드 전용
+      nodeSelector:
+        role: was
+      tolerations:
+        - key: "role"
+          operator: "Equal"
+          value: "was"
+          effect: "NoSchedule"
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+
+      volumes:
+        - name: tmp
+          emptyDir: {}                # /tmp writable
+
+      containers:
+        - name: was-api
+          image: ghcr.io/unklo1200/was-updated:v12
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+
+          envFrom:
+            - secretRef:
+                name: was-secrets
+            - configMapRef:
+                name: was-config
+          env:
+            # Redis 비밀번호는 redis-auth Secret에서 가져옴
+            - name: REDIS_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: REDIS_PASSWORD
+            # 헬스체크 동작 옵션
+            - name: HEALTH_DB_CHECK
+              value: "0"              # /health에서 DB 체크할 땐 1
+            - name: READY_DB_CHECK
+              value: "1"              # /readyz에 DB 체크 포함
+            - name: READINESS_ALLOW_NO_REDIS
+              value: "0"              # Redis 준비 전 임시 완화가 필요하면 1로
+            - name: TMPDIR
+              value: "/tmp"
+            - name: GUNICORN_CMD_ARGS
+              value: "--worker-tmp-dir /tmp"
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh","-c","sleep 5"]
+
+          # Start/Ready/Live Probes
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: 60
+            periodSeconds: 2
+            timeoutSeconds: 2
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 5
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true   # /tmp는 emptyDir로 쓰기 가능
+
+---
+# =========================================
+# 5) 내부 통신용 ClusterIP (DNS: was:8000)
+# =========================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: was
+  namespace: appnet
+spec:
+  type: ClusterIP
+  selector:
+    app: was-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+
+---
+# =========================================
+# 6) 내부 NLB (IP 타겟) — 파드 AZ 포함 서브넷 고정
+# =========================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: was-api-nlb
+  namespace: appnet
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"               # NLB
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"     # Pod IP 타깃
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"          # 내부 NLB
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: "/health"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "traffic-port"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: "HTTP"
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+    service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: "deregistration_delay.timeout_seconds=10"
+    # 파드가 배치되는 AZ(1a/1b/1c) 서브넷 명시 — Target.NotInUse 방지
+    service.beta.kubernetes.io/aws-load-balancer-subnets: "subnet-04c09752e47384a7b,subnet-0232a4e7b6a91ec96,subnet-0742da13e3b45f652"
+spec:
+  type: LoadBalancer
+  selector:
+    app: was-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
