@@ -30,7 +30,7 @@ jobs:
       # 매니페스트의 image 줄을 다이제스트로 고정 (재현성↑)
       - name: Update kubernetes manifest with new image
         run: |
-          sed -i "s#image: .*web-updated.*#image: ${DIGEST}#g" app/web-frontend/webapp.yaml
+          sed -i "s#image: .*web-updated.*#image: ${DIGEST}#g" apps/web-frontend/webapp.yaml
           git config user.name "ci-bot"
           git config user.email "ci-bot@users.noreply.github.com"
           git commit -am "chore(web): deploy ${TAG} (${DIGEST})" || echo "no manifest change"
