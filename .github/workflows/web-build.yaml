@@ -1,0 +1,48 @@
+name: web-build
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'web-revised/**'          # HTML/CSS/코드 변경 감지
+      - 'apps/web-frontend/webapp.yaml'  # 수동 수정도 트리거
+permissions:
+  contents: write     # 매니페스트 커밋을 위해 필요
+  packages: write     # GHCR 푸시를 위해 필요
+concurrency:
+  group: web-build
+  cancel-in-progress: true
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/unklo1200/web-updated
+      TAG: v${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Build & Push image
+        run: |
+          docker build -t $IMAGE:$TAG -f web-revised/Dockerfile web-revised
+          docker push $IMAGE:$TAG
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE:$TAG)
+          echo "DIGEST=$DIGEST" >> $GITHUB_ENV
+      # 매니페스트의 image 줄을 다이제스트로 고정 (재현성↑)
+      - name: Update kubernetes manifest with new image
+        run: |
+          sed -i "s#image: .*web-updated.*#image: ${DIGEST}#g" app/web-frontend/webapp.yaml
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          git commit -am "chore(web): deploy ${TAG} (${DIGEST})" || echo "no manifest change"
+          git push
+      # (옵션) 즉시 Argo CD 동기화까지 하고 싶다면 Secrets 추가 후 사용
+      - name: Argo CD sync (optional)
+        if: ${{ secrets.ARGOCD_SERVER != '' }}
+        run: |
+          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x argocd && sudo mv argocd /usr/local/bin/argocd
+          argocd login "${{ secrets.ARGOCD_SERVER }}" \
+            --username "${{ secrets.ARGOCD_USERNAME }}" \
+            --password "${{ secrets.ARGOCD_PASSWORD }}" \
+            --insecure --grpc-web
+          argocd app sync web-frontend

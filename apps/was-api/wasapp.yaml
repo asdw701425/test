@@ -93,7 +93,7 @@ spec:
       containers:
         - name: was-api
           image: ghcr.io/unklo1200/was-updated:v12
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 8000
