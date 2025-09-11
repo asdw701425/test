@@ -35,14 +35,15 @@ jobs:
           git config user.email "ci-bot@users.noreply.github.com"
           git commit -am "chore(web): deploy ${TAG} (${DIGEST})" || echo "no manifest change"
           git push
-      # (옵션) 즉시 Argo CD 동기화까지 하고 싶다면 Secrets 추가 후 사용
+     # (선택) 바로 Argo CD 동기화
       - name: Argo CD sync (optional)
-        if: ${{ secrets.ARGOCD_SERVER != '' }}
+        if: ${{ env.ARGOCD_SERVER != '' }}
+        env:
+          ARGOCD_SERVER:   ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_USERNAME: ${{ secrets.ARGOCD_USERNAME }}
+          ARGOCD_PASSWORD: ${{ secrets.ARGOCD_PASSWORD }}
         run: |
           curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
           chmod +x argocd && sudo mv argocd /usr/local/bin/argocd
-          argocd login "${{ secrets.ARGOCD_SERVER }}" \
-            --username "${{ secrets.ARGOCD_USERNAME }}" \
-            --password "${{ secrets.ARGOCD_PASSWORD }}" \
-            --insecure --grpc-web
+          argocd login "${ARGOCD_SERVER}" --username "${ARGOCD_USERNAME}" --password "${ARGOCD_PASSWORD}" --insecure --grpc-web
           argocd app sync was-api
