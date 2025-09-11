@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+<h5 class="mb-3">{{ sub.name }}</h5>
+
+{% if current %}
+<div class="card mb-4">
+  <div class="ratio ratio-16x9">
+    {% if current.embed_url %}
+      <iframe src="{{ current.embed_url }}" title="YouTube video player" frameborder="0"
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+              allowfullscreen></iframe>
+    {% else %}
+      <video controls style="width:100%;height:100%;">
+        <source src="{{ current.link }}">
+        이 브라우저는 video 태그를 지원하지 않습니다.
+      </video>
+    {% endif %}
+  </div>
+  <div class="card-body">
+    <strong>{{ current.title }}</strong>
+    <span class="text-secondary small ms-2">{{ idx + 1 }} / {{ videos|length }}</span>
+  </div>
+</div>
+{% else %}
+  <div class="alert alert-info">등록된 영상이 없습니다.</div>
+{% endif %}
+
+<h6 class="mb-2">영상 목록</h6>
+<ul class="list-group">
+  {% for v in videos %}
+    <li class="list-group-item d-flex justify-content-between align-items-center {% if loop.index0 == idx %}active{% endif %}">
+      <span class="text-truncate" style="max-width:70%;">{{ v.title }}</span>
+      <div class="d-flex gap-2">
+        <a class="btn btn-outline-light btn-sm {% if loop.index0 != idx %}btn-outline-success{% endif %}" href="?v={{ loop.index0 }}">이 페이지에서 재생</a>
+        <a class="btn btn-success btn-sm" href="{{ v.embed_url or v.link }}" target="_blank">새 창</a>
+      </div>
+    </li>
+  {% endfor %}
+</ul>
+{% endblock %}

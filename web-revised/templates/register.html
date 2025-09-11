@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<h5 class="mb-3">회원가입</h5>
+
+<form method="post" class="vstack gap-3" action="{{ register_action or '/api/register' }}">
+  <input name="username"  type="text"     class="form-control" placeholder="아이디"       autocomplete="username" required>
+  <input name="email"     type="email"    class="form-control" placeholder="이메일"       autocomplete="email"    required>
+  <input name="password"  type="password" class="form-control" placeholder="비밀번호"     autocomplete="new-password" required>
+  <input name="password2" type="password" class="form-control" placeholder="비밀번호 확인" autocomplete="new-password" required>
+
+  <button class="btn btn-success">가입하기</button>
+
+  <p class="small text-secondary m-0">
+    이미 계정이 있나요? <a href="{{ url_for('login_page') }}">로그인</a>
+  </p>
+</form>
+{% endblock %}

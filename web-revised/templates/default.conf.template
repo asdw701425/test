@@ -1,0 +1,43 @@
+server {
+  listen 80 default_server;
+  server_name _;
+
+  # 정적 파일 (옵션, 있으면 서빙)
+  location /static/ {
+    alias /usr/share/nginx/html/static/;
+    access_log off;
+    expires 1h;
+  }
+
+  # 헬스체크 엔드포인트
+  location = /healthz {
+    return 200 "ok";
+    add_header Content-Type text/plain;
+  }
+
+  # 환경변수로 받은 API 호스트와 포트 사용
+  set $api_host "${API_HOST}";
+  set $api_port "${API_PORT}";
+
+  # proxy_pass에 변수를 쓰면 resolver 필요함
+  resolver 169.254.169.253 valid=10s ipv6=off;
+
+  location / {
+    proxy_pass         http://$api_host:$api_port$request_uri;
+
+    proxy_http_version 1.1;
+
+    # 원래 요청 헤더 전달
+    proxy_set_header   Host              $host;
+    proxy_set_header   X-Forwarded-Host  $host;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header   Connection        "";
+
+    # 타임아웃 및 버퍼
+    proxy_connect_timeout  5s;
+    proxy_send_timeout     30s;
+    proxy_read_timeout     30s;
+    proxy_buffering        off;
+  }
+}
