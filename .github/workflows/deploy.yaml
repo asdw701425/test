@@ -1,0 +1,200 @@
+name: build-and-deploy
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "web-revised/**"          # 프론트 소스 경로 (필요시 수정)
+      - "was/**"          # WAS 소스 경로 (필요시 수정)
+      - "apps/web-frontend/**"    # 매니페스트 경로
+      - "apps/was-api/**"
+
+permissions:
+  contents: write   # ← 매니페스트 수정 후 커밋/푸시 하려면 write 필요
+
+concurrency:
+  group: build-deploy
+  cancel-in-progress: true
+
+jobs:
+  web-frontend:
+    name: Web Frontend
+    runs-on: ubuntu-latest
+    env:
+      CONTEXT_DIR: web-revised
+      MANIFEST_DIR: apps/web-frontend
+      IMAGE: ghcr.io/unklo1200/web-updated       # ← 너의 GHCR 경로로
+      TAG: v${{ github.run_number }}
+      ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}   # 옵션: 즉시 sync 원하면 사용
+      ARGOCD_USERNAME: admin                        # 옵션
+      ARGOCD_PASSWORD: ${{ secrets.ARGOCD_PASSWORD }} # 옵션
+    steps:
+      - uses: actions/checkout@v4
+
+      # 변경 없으면 스킵(선택)
+      - name: Skip if no web changes
+        id: web_changed
+        run: |
+          if git diff --quiet HEAD^ HEAD -- $CONTEXT_DIR $MANIFEST_DIR; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+      - name: Stop (no web changes)
+        if: steps.web_changed.outputs.changed == 'false'
+        run: echo "No changes for web; skipping." && exit 0
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u unklo1200 --password-stdin
+
+      - name: Build & Push (web)
+        run: |
+          docker build -t $IMAGE:$TAG $CONTEXT_DIR
+          docker push $IMAGE:$TAG
+
+      # 매니페스트의 모든 Deployment 컨테이너 이미지 값을 새 이미지로 치환
+      - name: Install yq
+        run: |
+          sudo curl -L https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 \
+            -o /usr/local/bin/yq && sudo chmod +x /usr/local/bin/yq
+      - name: Update manifests image (web-frontend)
+        run: |
+          set -e
+          find "$MANIFEST_DIR" -type f \( -iname "*deploy*.y*ml" -o -iname "*deployment*.y*ml" \) -print0 \
+          | xargs -0 -I{} sh -c \
+            'yq -i '"'"'(.spec.template.spec.containers[].image) = env(IMAGE) + ":" + env(TAG)'"'"' "{}"'
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -am "web-frontend: set image to $IMAGE:$TAG"
+            git push
+          else
+            echo "No manifest changes to commit."
+          fi
+
+      # (옵션) 지금 바로 싱크하고 싶을 때
+      - name: Install ArgoCD CLI
+        if: env.ARGOCD_SERVER != ''
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+      - name: ArgoCD Login & Sync (web-frontend)
+        if: env.ARGOCD_SERVER != ''
+        run: |
+          argocd login "$ARGOCD_SERVER" --username "$ARGOCD_USERNAME" --password "$ARGOCD_PASSWORD" --insecure --grpc-web
+          argocd app sync web-frontend --prune --grpc-web
+          argocd app wait web-frontend --health --sync
+
+      - name: Notify Slack (success)
+        if: ${{ success() }}
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          slack-message: |
+            ✅ *배포 성공 (web-frontend)*
+            • Image: `${{ env.IMAGE }}:${{ env.TAG }}`
+            • Ref: `${{ github.ref_name }}`
+            • Actor: `${{ github.actor }}`
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Notify Slack (failed)
+        if: ${{ failure() }}
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          slack-message: |
+            ❌ *배포 실패 (web-frontend)*
+            • 로그: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  was-api:
+    name: WAS API
+    runs-on: ubuntu-latest
+    env:
+      CONTEXT_DIR: was-revised
+      MANIFEST_DIR: apps/was-api
+      IMAGE: ghcr.io/unklo1200/was-updated        # ← 너의 GHCR 경로로
+      TAG: v${{ github.run_number }}
+      ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}   # 옵션
+      ARGOCD_USERNAME: admin
+      ARGOCD_PASSWORD: ${{ secrets.ARGOCD_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip if no was changes
+        id: was_changed
+        run: |
+          if git diff --quiet HEAD^ HEAD -- $CONTEXT_DIR $MANIFEST_DIR; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+      - name: Stop (no was changes)
+        if: steps.was_changed.outputs.changed == 'false'
+        run: echo "No changes for was; skipping." && exit 0
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u unklo1200 --password-stdin
+
+      - name: Build & Push (was)
+        run: |
+          docker build -t $IMAGE:$TAG $CONTEXT_DIR
+          docker push $IMAGE:$TAG
+
+      - name: Install yq
+        run: |
+          sudo curl -L https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 \
+            -o /usr/local/bin/yq && sudo chmod +x /usr/local/bin/yq
+      - name: Update manifests image (was-api)
+        run: |
+          set -e
+          find "$MANIFEST_DIR" -type f \( -iname "*deploy*.y*ml" -o -iname "*deployment*.y*ml" \) -print0 \
+          | xargs -0 -I{} sh -c \
+            'yq -i '"'"'(.spec.template.spec.containers[].image) = env(IMAGE) + ":" + env(TAG)'"'"' "{}"'
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -am "was-api: set image to $IMAGE:$TAG"
+            git push
+          else
+            echo "No manifest changes to commit."
+          fi
+
+      - name: Install ArgoCD CLI
+        if: env.ARGOCD_SERVER != ''
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+      - name: ArgoCD Login & Sync (was-api)
+        if: env.ARGOCD_SERVER != ''
+        run: |
+          argocd login "$ARGOCD_SERVER" --username "$ARGOCD_USERNAME" --password "$ARGOCD_PASSWORD" --insecure --grpc-web
+          argocd app sync was-api --prune --grpc-web
+          argocd app wait was-api --health --sync
+
+      - name: Notify Slack (success)
+        if: ${{ success() }}
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          slack-message: |
+            ✅ *배포 성공 (was-api)*
+            • Image: `${{ env.IMAGE }}:${{ env.TAG }}`
+            • Ref: `${{ github.ref_name }}`
+            • Actor: `${{ github.actor }}`
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Notify Slack (failed)
+        if: ${{ failure() }}
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          slack-message: |
+            ❌ *배포 실패 (was-api)*
+            • 로그: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
