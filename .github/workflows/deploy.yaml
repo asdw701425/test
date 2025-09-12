@@ -22,7 +22,7 @@ jobs:
     env:
       CONTEXT_DIR: web-revised
       MANIFEST_DIR: apps/web-frontend
-      IMAGE: ghcr.io/<<너의 GHCR 아이디>>/<<web-리포>>
+      IMAGE: ghcr.io/unklo1200/was-updated
       TAG: v${{ github.run_number }}
       ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
       ARGOCD_USERNAME: admin
@@ -41,7 +41,7 @@ jobs:
 
       - name: Login to GHCR
         if: steps.web_changed.outputs.changed == 'true'
-        run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u <<너의 GHCR 아이디>> --password-stdin
+        run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u unklo1200 --password-stdin
 
       - name: Build & Push (web)
         if: steps.web_changed.outputs.changed == 'true'
@@ -109,7 +109,7 @@ jobs:
     env:
       CONTEXT_DIR: was                 # 트리거와 일치
       MANIFEST_DIR: apps/was-api
-      IMAGE: ghcr.io/<<너의 GHCR 아이디>>/<<was-리포>>
+      IMAGE: ghcr.io/unklo1200/was-updated
       TAG: v${{ github.run_number }}
       ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
       ARGOCD_USERNAME: admin
@@ -128,7 +128,7 @@ jobs:
 
       - name: Login to GHCR
         if: steps.was_changed.outputs.changed == 'true'
-        run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u <<너의 GHCR 아이디>> --password-stdin
+        run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u unklo1200 --password-stdin
 
       - name: Build & Push (was)
         if: steps.was_changed.outputs.changed == 'true'
