@@ -99,7 +99,7 @@ spec:
               fi
       containers:
         - name: web
-          image: ghcr.io/unklo1200/web-updated@sha256:8205dc8be3f9d604e78838eea4d308d4d0af0edc9cc90e4f13d5beaa393c244a
+          image: ghcr.io/unklo1200/web-updated@sha256:01afce270cb193f0570908b74c1f0a15c9f3c3b0bce96728f57d657c2832bcfb
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
