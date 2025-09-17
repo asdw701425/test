@@ -62,7 +62,7 @@ metadata:
   labels:
     app: was-api
 spec:
-  replicas: 1
+  replicas: 4
   selector:
     matchLabels:
       app: was-api
