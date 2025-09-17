@@ -92,7 +92,7 @@ spec:
 
       containers:
         - name: was-api
-          image: ghcr.io/unklo1200/was-updated:v12
+          image: ghcr.io/unklo1200/was-updated@sha256:ea972d9646d81bd4023aa7ce66966ab87d82d209ea31f03fb92f491384239428
           imagePullPolicy: Always
           ports:
             - name: http
