@@ -7,14 +7,15 @@ on:
       - "was/**"
       - "apps/web-frontend/**"
       - "apps/was-api/**"
-
 permissions:
   contents: write
-
 concurrency:
   group: build-deploy
   cancel-in-progress: true
-
+env:
+  # 공통: Argo CD 접속 (호스트만! 예: afbe97...elb.amazonaws.com)
+  ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+  ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
 jobs:
   web-frontend:
     if: github.actor != 'github-actions[bot]'   # 봇 커밋 재트리거 방지
@@ -22,43 +23,42 @@ jobs:
     env:
       CONTEXT_DIR: web-revised
       MANIFEST_DIR: apps/web-frontend
-      IMAGE: ghcr.io/unklo1200/was-updated
+      IMAGE: ghcr.io/unklo1200/web-updated
       TAG: v${{ github.run_number }}
-      ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
-      ARGOCD_USERNAME: admin
-      ARGOCD_PASSWORD: ${{ secrets.ARGOCD_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Check changes (web)
+      - name: Detect changes safely (web)
         id: web_changed
+        shell: bash
         run: |
-          if git diff --quiet HEAD^ HEAD -- "$CONTEXT_DIR" "$MANIFEST_DIR"; then
-            echo "changed=false" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            if git diff --quiet HEAD^ HEAD -- "$CONTEXT_DIR" "$MANIFEST_DIR"; then
+              echo "changed=false" >> $GITHUB_OUTPUT
+            else
+              echo "changed=true" >> $GITHUB_OUTPUT
+            fi
           else
+            echo "First run: treating as changed."
             echo "changed=true" >> $GITHUB_OUTPUT
           fi
-
       - name: Login to GHCR
         if: steps.web_changed.outputs.changed == 'true'
-        run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u unklo1200 --password-stdin
-
+        run: echo "${{ secrets.GHCR_PAT || github.token }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
       - name: Build & Push (web)
         if: steps.web_changed.outputs.changed == 'true'
         run: |
           docker build -t $IMAGE:$TAG "$CONTEXT_DIR"
           docker push $IMAGE:$TAG
-
       - name: Install yq
         if: steps.web_changed.outputs.changed == 'true'
         run: |
           sudo curl -L https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq
           sudo chmod +x /usr/local/bin/yq
-
       - name: Update manifests image (web-frontend)
         if: steps.web_changed.outputs.changed == 'true'
         run: |
-          set -e
+          set -euo pipefail
           find "$MANIFEST_DIR" -type f \( -iname "*deploy*.y*ml" -o -iname "*deployment*.y*ml" \) -print0 \
           | xargs -0 -I{} sh -c 'yq -i '"'"'(.spec.template.spec.containers[].image) = env(IMAGE) + ":" + env(TAG)'"'"' "{}"'
           if ! git diff --quiet; then
@@ -69,83 +69,101 @@ jobs:
           else
             echo "No manifest changes to commit."
           fi
-
-      - name: ArgoCD Login & Sync (web-frontend)
+      - name: Install ArgoCD CLI
         if: steps.web_changed.outputs.changed == 'true' && env.ARGOCD_SERVER != ''
         run: |
           curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
           chmod +x /usr/local/bin/argocd
-          argocd login "$ARGOCD_SERVER" --username "$ARGOCD_USERNAME" --password "$ARGOCD_PASSWORD" --insecure --grpc-web
-          argocd app sync web-frontend --prune --grpc-web
-          argocd app wait web-frontend --health --sync
-
+      - name: ArgoCD Login (token) & Create/Sync (web-frontend)
+        if: steps.web_changed.outputs.changed == 'true' && env.ARGOCD_SERVER != ''
+        env:
+          APP_NAME: web-frontend
+          APP_REPO: https://github.com/unklo1200/soldesk901
+          APP_PATH: manifests/charts/web
+          DEST_SERVER: https://kubernetes.default.svc
+          DEST_NS: web
+        run: |
+          set -euo pipefail
+          argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web --insecure
+          argocd account get-user-info
+          if argocd app get "$APP_NAME" >/dev/null 2>&1; then
+            echo "[INFO] $APP_NAME exists. Syncing..."
+          else
+            echo "[INFO] $APP_NAME not found. Creating..."
+            argocd app create "$APP_NAME" \
+              --repo "$APP_REPO" \
+              --path "$APP_PATH" \
+              --dest-server "$DEST_SERVER" \
+              --dest-namespace "$DEST_NS" \
+              --project default \
+              --sync-policy none
+          fi
+          argocd app sync "$APP_NAME" --grpc-web --prune
+          argocd app wait "$APP_NAME" --health --timeout 300
       - name: Notify Slack (success)
         if: steps.web_changed.outputs.changed == 'true' && success()
         uses: slackapi/slack-github-action@v1
         with:
           channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
           slack-message: |
-            ✅ *배포 성공 (web-frontend)*
+            :흰색_확인_표시: *배포 성공 (web-frontend)*
             • Image: `${{ env.IMAGE }}:${{ env.TAG }}`
             • Ref: `${{ github.ref_name }}`
             • Actor: `${{ github.actor }}`
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-
       - name: Notify Slack (failed)
         if: steps.web_changed.outputs.changed == 'true' && failure()
         uses: slackapi/slack-github-action@v1
         with:
           channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
           slack-message: |
-            ❌ *배포 실패 (web-frontend)*
+            :x: *배포 실패 (web-frontend)*
             • 로그: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-
   was-api:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     env:
-      CONTEXT_DIR: was                 # 트리거와 일치
+      CONTEXT_DIR: was
       MANIFEST_DIR: apps/was-api
       IMAGE: ghcr.io/unklo1200/was-updated
       TAG: v${{ github.run_number }}
-      ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
-      ARGOCD_USERNAME: admin
-      ARGOCD_PASSWORD: ${{ secrets.ARGOCD_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Check changes (was)
+      - name: Detect changes safely (was)
         id: was_changed
+        shell: bash
         run: |
-          if git diff --quiet HEAD^ HEAD -- "$CONTEXT_DIR" "$MANIFEST_DIR"; then
-            echo "changed=false" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            if git diff --quiet HEAD^ HEAD -- "$CONTEXT_DIR" "$MANIFEST_DIR"; then
+              echo "changed=false" >> $GITHUB_OUTPUT
+            else
+              echo "changed=true" >> $GITHUB_OUTPUT
+            fi
           else
+            echo "First run: treating as changed."
             echo "changed=true" >> $GITHUB_OUTPUT
           fi
-
       - name: Login to GHCR
         if: steps.was_changed.outputs.changed == 'true'
-        run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u unklo1200 --password-stdin
-
+        run: echo "${{ secrets.GHCR_PAT || github.token }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
       - name: Build & Push (was)
         if: steps.was_changed.outputs.changed == 'true'
         run: |
           docker build -t $IMAGE:$TAG "$CONTEXT_DIR"
           docker push $IMAGE:$TAG
-
       - name: Install yq
         if: steps.was_changed.outputs.changed == 'true'
         run: |
           sudo curl -L https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq
           sudo chmod +x /usr/local/bin/yq
-
       - name: Update manifests image (was-api)
         if: steps.was_changed.outputs.changed == 'true'
         run: |
-          set -e
+          set -euo pipefail
           find "$MANIFEST_DIR" -type f \( -iname "*deploy*.y*ml" -o -iname "*deployment*.y*ml" \) -print0 \
           | xargs -0 -I{} sh -c 'yq -i '"'"'(.spec.template.spec.containers[].image) = env(IMAGE) + ":" + env(TAG)'"'"' "{}"'
           if ! git diff --quiet; then
@@ -156,36 +174,56 @@ jobs:
           else
             echo "No manifest changes to commit."
           fi
-
-      - name: ArgoCD Login & Sync (was-api)
+      - name: Install ArgoCD CLI
         if: steps.was_changed.outputs.changed == 'true' && env.ARGOCD_SERVER != ''
         run: |
           curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
           chmod +x /usr/local/bin/argocd
-          argocd login "$ARGOCD_SERVER" --username "$ARGOCD_USERNAME" --password "$ARGOCD_PASSWORD" --insecure --grpc-web
-          argocd app sync was-api --prune --grpc-web
-          argocd app wait was-api --health --sync
-
+      - name: ArgoCD Login (token) & Create/Sync (was-api)
+        if: steps.was_changed.outputs.changed == 'true' && env.ARGOCD_SERVER != ''
+        env:
+          APP_NAME: was-api
+          APP_REPO: https://github.com/unklo1200/soldesk901
+          APP_PATH: manifests/was   # ← 당신 리포 구조에 맞게 조정(예시: manifests/was 또는 apps/was-api 내 Helm/Manifests)
+          DEST_SERVER: https://kubernetes.default.svc
+          DEST_NS: was
+        run: |
+          set -euo pipefail
+          argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web --insecure
+          argocd account get-user-info
+          if argocd app get "$APP_NAME" >/dev/null 2>&1; then
+            echo "[INFO] $APP_NAME exists. Syncing..."
+          else
+            echo "[INFO] $APP_NAME not found. Creating..."
+            argocd app create "$APP_NAME" \
+              --repo "$APP_REPO" \
+              --path "$APP_PATH" \
+              --dest-server "$DEST_SERVER" \
+              --dest-namespace "$DEST_NS" \
+              --project default \
+              --sync-policy none
+          fi
+          argocd app sync "$APP_NAME" --grpc-web --prune
+          argocd app wait "$APP_NAME" --health --timeout 300
       - name: Notify Slack (success)
         if: steps.was_changed.outputs.changed == 'true' && success()
         uses: slackapi/slack-github-action@v1
         with:
           channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
           slack-message: |
-            ✅ *배포 성공 (was-api)*
+            :흰색_확인_표시: *배포 성공 (was-api)*
             • Image: `${{ env.IMAGE }}:${{ env.TAG }}`
             • Ref: `${{ github.ref_name }}`
             • Actor: `${{ github.actor }}`
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-
       - name: Notify Slack (failed)
         if: steps.was_changed.outputs.changed == 'true' && failure()
         uses: slackapi/slack-github-action@v1
         with:
           channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
           slack-message: |
-            ❌ *배포 실패 (was-api)*
+            :x: *배포 실패 (was-api)*
             • 로그: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
