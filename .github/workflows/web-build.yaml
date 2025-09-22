@@ -44,8 +44,7 @@ jobs:
           git commit -am "chore(web): deploy ${TAG} (${DIGEST})" || echo "no manifest change"
           git push
 
-      # (선택) 바로 Argo CD 동기화
-      - name: Argo CD sync (auto-detect transport)
+      - name: Argo CD sync (auto-detect transport + SNI fix)
         env:
           ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
@@ -57,18 +56,18 @@ jobs:
           fi
           echo "::add-mask::${ARGOCD_AUTH_TOKEN}"
 
-          # install CLI
+          # Install CLI
           if ! command -v argocd >/dev/null 2>&1; then
             curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
             chmod +x /usr/local/bin/argocd
           fi
           argocd version --client
 
-          # reachability
+          # Reachability
           timeout 3 bash -c "cat < /dev/null > /dev/tcp/${ARGOCD_SERVER}/443" \
             && echo "443 reachable" || (echo "443 not reachable to $ARGOCD_SERVER"; exit 1)
 
-          # subpath probe
+          # Subpath probe
           ROOT_PATH=""
           CODE_ROOT=$(curl -skI "https://${ARGOCD_SERVER}/"        | head -n1 | awk '{print $2}' || true)
           CODE_SUB=$(curl -skI "https://${ARGOCD_SERVER}/argocd/"  | head -n1 | awk '{print $2}' || true)
@@ -79,23 +78,36 @@ jobs:
             echo "Detected root-path install (HTTP ${CODE_ROOT:-?})"
           fi
 
+          # SNI/서버명 강제 (내부 서비스 DNS)
+          ARGOCD_SERVER_NAME="argocd-server.argocd.svc"
+
           do_login_and_sync () {
             local MODE="$1"
             echo "[MODE] $MODE"
             case "$MODE" in
               grpcweb-root)
-                argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure \
-                  --grpc-web --grpc-web-root-path "${ROOT_PATH:-/argocd}"
+                argocd login "$ARGOCD_SERVER" \
+                  --auth-token "$ARGOCD_AUTH_TOKEN" \
+                  --server-name "$ARGOCD_SERVER_NAME" \
+                  --grpc-web --grpc-web-root-path "${ROOT_PATH:-/argocd}" \
+                  --insecure
                 ;;
               grpcweb)
-                argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure \
-                  --grpc-web
+                argocd login "$ARGOCD_SERVER" \
+                  --auth-token "$ARGOCD_AUTH_TOKEN" \
+                  --server-name "$ARGOCD_SERVER_NAME" \
+                  --grpc-web \
+                  --insecure
                 ;;
               direct)
-                argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure
+                argocd login "$ARGOCD_SERVER" \
+                  --auth-token "$ARGOCD_AUTH_TOKEN" \
+                  --server-name "$ARGOCD_SERVER_NAME" \
+                  --insecure
                 ;;
               *) echo "unknown mode: $MODE"; return 2;;
             esac
+
             argocd account get-user-info
             if [ "$MODE" = "direct" ]; then
               argocd app sync "$APP_NAME" --prune
@@ -122,6 +134,6 @@ jobs:
           set -e
 
           if [ ${RC:-1} -ne 0 ]; then
-            echo "All Argo CD login modes failed (EOF/TLS/proxy mismatch suspected)."
+            echo "All Argo CD login modes failed."
             exit $RC
           fi

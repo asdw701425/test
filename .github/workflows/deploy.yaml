@@ -81,7 +81,7 @@ jobs:
             echo "No manifest changes to commit."
           fi
 
-      - name: Argo CD sync (auto-detect transport)
+      - name: Argo CD sync (auto-detect transport + SNI fix)
         if: steps.web_changed.outputs.changed == 'true'
         env:
           APP_NAME: web-frontend
@@ -111,23 +111,35 @@ jobs:
             echo "Detected root-path install (HTTP ${CODE_ROOT:-?})"
           fi
 
+          ARGOCD_SERVER_NAME="argocd-server.argocd.svc"
+
           do_login_and_sync () {
             local MODE="$1"
             echo "[MODE] $MODE"
             case "$MODE" in
               grpcweb-root)
-                argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure \
-                  --grpc-web --grpc-web-root-path "${ROOT_PATH:-/argocd}"
+                argocd login "$ARGOCD_SERVER" \
+                  --auth-token "$ARGOCD_AUTH_TOKEN" \
+                  --server-name "$ARGOCD_SERVER_NAME" \
+                  --grpc-web --grpc-web-root-path "${ROOT_PATH:-/argocd}" \
+                  --insecure
                 ;;
               grpcweb)
-                argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure \
-                  --grpc-web
+                argocd login "$ARGOCD_SERVER" \
+                  --auth-token "$ARGOCD_AUTH_TOKEN" \
+                  --server-name "$ARGOCD_SERVER_NAME" \
+                  --grpc-web \
+                  --insecure
                 ;;
               direct)
-                argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure
+                argocd login "$ARGOCD_SERVER" \
+                  --auth-token "$ARGOCD_AUTH_TOKEN" \
+                  --server-name "$ARGOCD_SERVER_NAME" \
+                  --insecure
                 ;;
               *) echo "unknown mode: $MODE"; return 2;;
             esac
+
             argocd account get-user-info
             if [ "$MODE" = "direct" ]; then
               argocd app sync "$APP_NAME" --prune
@@ -154,7 +166,7 @@ jobs:
           set -e
 
           if [ ${RC:-1} -ne 0 ]; then
-            echo "All Argo CD login modes failed (EOF/TLS/proxy mismatch suspected)."
+            echo "All Argo CD login modes failed."
             exit $RC
           fi
 
@@ -218,7 +230,7 @@ jobs:
             echo "No manifest changes to commit."
           fi
 
-      - name: Argo CD sync (auto-detect transport)
+      - name: Argo CD sync (auto-detect transport + SNI fix)
         if: steps.was_changed.outputs.changed == 'true'
         env:
           APP_NAME: was-api
@@ -248,23 +260,35 @@ jobs:
             echo "Detected root-path install (HTTP ${CODE_ROOT:-?})"
           fi
 
+          ARGOCD_SERVER_NAME="argocd-server.argocd.svc"
+
           do_login_and_sync () {
             local MODE="$1"
             echo "[MODE] $MODE"
             case "$MODE" in
               grpcweb-root)
-                argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure \
-                  --grpc-web --grpc-web-root-path "${ROOT_PATH:-/argocd}"
+                argocd login "$ARGOCD_SERVER" \
+                  --auth-token "$ARGOCD_AUTH_TOKEN" \
+                  --server-name "$ARGOCD_SERVER_NAME" \
+                  --grpc-web --grpc-web-root-path "${ROOT_PATH:-/argocd}" \
+                  --insecure
                 ;;
               grpcweb)
-                argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure \
-                  --grpc-web
+                argocd login "$ARGOCD_SERVER" \
+                  --auth-token "$ARGOCD_AUTH_TOKEN" \
+                  --server-name "$ARGOCD_SERVER_NAME" \
+                  --grpc-web \
+                  --insecure
                 ;;
               direct)
-                argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure
+                argocd login "$ARGOCD_SERVER" \
+                  --auth-token "$ARGOCD_AUTH_TOKEN" \
+                  --server-name "$ARGOCD_SERVER_NAME" \
+                  --insecure
                 ;;
               *) echo "unknown mode: $MODE"; return 2;;
             esac
+
             argocd account get-user-info
             if [ "$MODE" = "direct" ]; then
               argocd app sync "$APP_NAME" --prune
@@ -291,5 +315,5 @@ jobs:
           set -e
 
           if [ ${RC:-1} -ne 0 ]; then
-            echo "All Argo CD login modes failed (EOF/TLS/proxy mismatch suspected)."
+            echo "All Argo CD login modes failed."
             exit $RC
