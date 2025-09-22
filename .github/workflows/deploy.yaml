@@ -1,5 +1,4 @@
 name: build-and-deploy
-
 on:
   push:
     branches: ["main"]
@@ -57,6 +56,7 @@ jobs:
       - name: Build & Push (web)
         if: steps.web_changed.outputs.changed == 'true'
         run: |
+          set -euo pipefail
           docker build -t $IMAGE:$TAG "$CONTEXT_DIR"
           docker push $IMAGE:$TAG
 
@@ -81,73 +81,82 @@ jobs:
             echo "No manifest changes to commit."
           fi
 
-      - name: Install ArgoCD CLI
-        if: steps.web_changed.outputs.changed == 'true'
-        run: |
-          curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-          chmod +x /usr/local/bin/argocd
-
-      - name: ArgoCD Login (token) & Create/Sync (web-frontend)
+      - name: Argo CD sync (auto-detect transport)
         if: steps.web_changed.outputs.changed == 'true'
         env:
           APP_NAME: web-frontend
-          APP_REPO: https://github.com/unklo1200/soldesk901
-          APP_PATH: ${{ env.MANIFEST_DIR }}
-          DEST_SERVER: https://kubernetes.default.svc
-          DEST_NS: web
         run: |
           set -euo pipefail
           if [ -z "${ARGOCD_SERVER:-}" ] || [ -z "${ARGOCD_AUTH_TOKEN:-}" ]; then
             echo "Skipping Argo CD sync: missing secrets"; exit 0
           fi
-
-          # Assert + reachability
           echo "::add-mask::${ARGOCD_AUTH_TOKEN}"
+
+          if ! command -v argocd >/dev/null 2>&1; then
+            curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+            chmod +x /usr/local/bin/argocd
+          fi
+          argocd version --client
+
           timeout 3 bash -c "cat < /dev/null > /dev/tcp/${ARGOCD_SERVER}/443" \
             && echo "443 reachable" || (echo "443 not reachable to $ARGOCD_SERVER"; exit 1)
 
-          argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web --insecure
-          argocd account get-user-info
-
-          if argocd app get "$APP_NAME" >/dev/null 2>&1; then
-            echo "[INFO] $APP_NAME exists. Syncing..."
+          ROOT_PATH=""
+          CODE_ROOT=$(curl -skI "https://${ARGOCD_SERVER}/"        | head -n1 | awk '{print $2}' || true)
+          CODE_SUB=$(curl -skI "https://${ARGOCD_SERVER}/argocd/"  | head -n1 | awk '{print $2}' || true)
+          if [ "${CODE_SUB:-}" = "200" ] || [ "${CODE_SUB:-}" = "302" ]; then
+            ROOT_PATH="/argocd"
+            echo "Detected subpath install at /argocd (HTTP ${CODE_SUB})"
           else
-            echo "[INFO] $APP_NAME not found. Creating..."
-            argocd app create "$APP_NAME" \
-              --repo "$APP_REPO" \
-              --path "$APP_PATH" \
-              --dest-server "$DEST_SERVER" \
-              --dest-namespace "$DEST_NS" \
-              --project default \
-              --sync-policy none
+            echo "Detected root-path install (HTTP ${CODE_ROOT:-?})"
           fi
 
-          argocd app sync "$APP_NAME" --grpc-web --prune
-          argocd app wait "$APP_NAME" --health --timeout 300
+          do_login_and_sync () {
+            local MODE="$1"
+            echo "[MODE] $MODE"
+            case "$MODE" in
+              grpcweb-root)
+                argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure \
+                  --grpc-web --grpc-web-root-path "${ROOT_PATH:-/argocd}"
+                ;;
+              grpcweb)
+                argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure \
+                  --grpc-web
+                ;;
+              direct)
+                argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure
+                ;;
+              *) echo "unknown mode: $MODE"; return 2;;
+            esac
+            argocd account get-user-info
+            if [ "$MODE" = "direct" ]; then
+              argocd app sync "$APP_NAME" --prune
+            else
+              argocd app sync "$APP_NAME" --grpc-web --prune
+            fi
+            argocd app wait "$APP_NAME" --health --timeout 300
+          }
 
-      - name: Notify Slack (success)
-        if: steps.web_changed.outputs.changed == 'true' && success()
-        uses: slackapi/slack-github-action@v1
-        with:
-          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
-          slack-message: |
-            :white_check_mark: *배포 성공 (web-frontend)*
-            • Image: `${{ env.IMAGE }}:${{ env.TAG }}`
-            • Ref: `${{ github.ref_name }}`
-            • Actor: `${{ github.actor }}`
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          set +e
+          if [ -n "$ROOT_PATH" ]; then
+            do_login_and_sync grpcweb-root; RC=$?
+            if [ $RC -ne 0 ]; then
+              echo "grpcweb-root failed, trying grpcweb..."
+              do_login_and_sync grpcweb; RC=$?
+            fi
+          else
+            do_login_and_sync direct; RC=$?
+            if [ $RC -ne 0 ]; then
+              echo "direct failed, trying grpcweb..."
+              do_login_and_sync grpcweb; RC=$?
+            fi
+          fi
+          set -e
 
-      - name: Notify Slack (failed)
-        if: steps.web_changed.outputs.changed == 'true' && failure()
-        uses: slackapi/slack-github-action@v1
-        with:
-          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
-          slack-message: |
-            :x: *배포 실패 (web-frontend)*
-            • 로그: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          if [ ${RC:-1} -ne 0 ]; then
+            echo "All Argo CD login modes failed (EOF/TLS/proxy mismatch suspected)."
+            exit $RC
+          fi
 
   was-api:
     if: github.actor != 'github-actions[bot]'
@@ -184,6 +193,7 @@ jobs:
       - name: Build & Push (was)
         if: steps.was_changed.outputs.changed == 'true'
         run: |
+          set -euo pipefail
           docker build -t $IMAGE:$TAG "$CONTEXT_DIR"
           docker push $IMAGE:$TAG
 
@@ -208,69 +218,78 @@ jobs:
             echo "No manifest changes to commit."
           fi
 
-      - name: Install ArgoCD CLI
-        if: steps.was_changed.outputs.changed == 'true'
-        run: |
-          curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-          chmod +x /usr/local/bin/argocd
-
-      - name: ArgoCD Login (token) & Create/Sync (was-api)
+      - name: Argo CD sync (auto-detect transport)
         if: steps.was_changed.outputs.changed == 'true'
         env:
           APP_NAME: was-api
-          APP_REPO: https://github.com/unklo1200/soldesk901
-          APP_PATH: ${{ env.MANIFEST_DIR }}
-          DEST_SERVER: https://kubernetes.default.svc
-          DEST_NS: was
         run: |
           set -euo pipefail
           if [ -z "${ARGOCD_SERVER:-}" ] || [ -z "${ARGOCD_AUTH_TOKEN:-}" ]; then
             echo "Skipping Argo CD sync: missing secrets"; exit 0
           fi
-
           echo "::add-mask::${ARGOCD_AUTH_TOKEN}"
+
+          if ! command -v argocd >/dev/null 2>&1; then
+            curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+            chmod +x /usr/local/bin/argocd
+          fi
+          argocd version --client
+
           timeout 3 bash -c "cat < /dev/null > /dev/tcp/${ARGOCD_SERVER}/443" \
             && echo "443 reachable" || (echo "443 not reachable to $ARGOCD_SERVER"; exit 1)
 
-          argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web --insecure
-          argocd account get-user-info
-
-          if argocd app get "$APP_NAME" >/dev/null 2>&1; then
-            echo "[INFO] $APP_NAME exists. Syncing..."
+          ROOT_PATH=""
+          CODE_ROOT=$(curl -skI "https://${ARGOCD_SERVER}/"        | head -n1 | awk '{print $2}' || true)
+          CODE_SUB=$(curl -skI "https://${ARGOCD_SERVER}/argocd/"  | head -n1 | awk '{print $2}' || true)
+          if [ "${CODE_SUB:-}" = "200" ] || [ "${CODE_SUB:-}" = "302" ]; then
+            ROOT_PATH="/argocd"
+            echo "Detected subpath install at /argocd (HTTP ${CODE_SUB})"
           else
-            echo "[INFO] $APP_NAME not found. Creating..."
-            argocd app create "$APP_NAME" \
-              --repo "$APP_REPO" \
-              --path "$APP_PATH" \
-              --dest-server "$DEST_SERVER" \
-              --dest-namespace "$DEST_NS" \
-              --project default \
-              --sync-policy none
+            echo "Detected root-path install (HTTP ${CODE_ROOT:-?})"
           fi
 
-          argocd app sync "$APP_NAME" --grpc-web --prune
-          argocd app wait "$APP_NAME" --health --timeout 300
+          do_login_and_sync () {
+            local MODE="$1"
+            echo "[MODE] $MODE"
+            case "$MODE" in
+              grpcweb-root)
+                argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure \
+                  --grpc-web --grpc-web-root-path "${ROOT_PATH:-/argocd}"
+                ;;
+              grpcweb)
+                argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure \
+                  --grpc-web
+                ;;
+              direct)
+                argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure
+                ;;
+              *) echo "unknown mode: $MODE"; return 2;;
+            esac
+            argocd account get-user-info
+            if [ "$MODE" = "direct" ]; then
+              argocd app sync "$APP_NAME" --prune
+            else
+              argocd app sync "$APP_NAME" --grpc-web --prune
+            fi
+            argocd app wait "$APP_NAME" --health --timeout 300
+          }
 
-      - name: Notify Slack (success)
-        if: steps.was_changed.outputs.changed == 'true' && success()
-        uses: slackapi/slack-github-action@v1
-        with:
-          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
-          slack-message: |
-            :white_check_mark: *배포 성공 (was-api)*
-            • Image: `${{ env.IMAGE }}:${{ env.TAG }}`
-            • Ref: `${{ github.ref_name }}`
-            • Actor: `${{ github.actor }}`
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          set +e
+          if [ -n "$ROOT_PATH" ]; then
+            do_login_and_sync grpcweb-root; RC=$?
+            if [ $RC -ne 0 ]; then
+              echo "grpcweb-root failed, trying grpcweb..."
+              do_login_and_sync grpcweb; RC=$?
+            fi
+          else
+            do_login_and_sync direct; RC=$?
+            if [ $RC -ne 0 ]; then
+              echo "direct failed, trying grpcweb..."
+              do_login_and_sync grpcweb; RC=$?
+            fi
+          fi
+          set -e
 
-      - name: Notify Slack (failed)
-        if: steps.was_changed.outputs.changed == 'true' && failure()
-        uses: slackapi/slack-github-action@v1
-        with:
-          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
-          slack-message: |
-            :x: *배포 실패 (was-api)*
-            • 로그: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          if [ ${RC:-1} -ne 0 ]; then
+            echo "All Argo CD login modes failed (EOF/TLS/proxy mismatch suspected)."
+            exit $RC

@@ -29,6 +29,7 @@ jobs:
 
       - name: Build & Push image
         run: |
+          set -euo pipefail
           docker build -t $IMAGE:$TAG -f was/Dockerfile was
           docker push $IMAGE:$TAG
           DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE:$TAG)
@@ -36,6 +37,7 @@ jobs:
 
       - name: Update kubernetes manifest with new image
         run: |
+          set -euo pipefail
           sed -i "s#image: .*was-updated.*#image: ${DIGEST}#g" apps/was-api/wasapp.yaml
           git config user.name "ci-bot"
           git config user.email "ci-bot@users.noreply.github.com"
@@ -43,22 +45,79 @@ jobs:
           git push
 
       # (선택) 바로 Argo CD 동기화
-      - name: Argo CD sync (optional)
+      - name: Argo CD sync (auto-detect transport)
         env:
           ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          APP_NAME: was-api
         run: |
           set -euo pipefail
           if [ -z "${ARGOCD_SERVER:-}" ] || [ -z "${ARGOCD_AUTH_TOKEN:-}" ]; then
             echo "Skipping Argo CD sync: missing secrets"; exit 0
           fi
+          echo "::add-mask::${ARGOCD_AUTH_TOKEN}"
 
-          curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-          chmod +x /usr/local/bin/argocd
+          if ! command -v argocd >/dev/null 2>&1; then
+            curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+            chmod +x /usr/local/bin/argocd
+          fi
+          argocd version --client
 
           timeout 3 bash -c "cat < /dev/null > /dev/tcp/${ARGOCD_SERVER}/443" \
             && echo "443 reachable" || (echo "443 not reachable to $ARGOCD_SERVER"; exit 1)
 
-          argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web --insecure
-          argocd account get-user-info
-          argocd app sync was-api --grpc-web
+          ROOT_PATH=""
+          CODE_ROOT=$(curl -skI "https://${ARGOCD_SERVER}/"        | head -n1 | awk '{print $2}' || true)
+          CODE_SUB=$(curl -skI "https://${ARGOCD_SERVER}/argocd/"  | head -n1 | awk '{print $2}' || true)
+          if [ "${CODE_SUB:-}" = "200" ] || [ "${CODE_SUB:-}" = "302" ]; then
+            ROOT_PATH="/argocd"
+            echo "Detected subpath install at /argocd (HTTP ${CODE_SUB})"
+          else
+            echo "Detected root-path install (HTTP ${CODE_ROOT:-?})"
+          fi
+
+          do_login_and_sync () {
+            local MODE="$1"
+            echo "[MODE] $MODE"
+            case "$MODE" in
+              grpcweb-root)
+                argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure \
+                  --grpc-web --grpc-web-root-path "${ROOT_PATH:-/argocd}"
+                ;;
+              grpcweb)
+                argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure \
+                  --grpc-web
+                ;;
+              direct)
+                argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure
+                ;;
+              *) echo "unknown mode: $MODE"; return 2;;
+            esac
+            argocd account get-user-info
+            if [ "$MODE" = "direct" ]; then
+              argocd app sync "$APP_NAME" --prune
+            else
+              argocd app sync "$APP_NAME" --grpc-web --prune
+            fi
+            argocd app wait "$APP_NAME" --health --timeout 300
+          }
+
+          set +e
+          if [ -n "$ROOT_PATH" ]; then
+            do_login_and_sync grpcweb-root; RC=$?
+            if [ $RC -ne 0 ]; then
+              echo "grpcweb-root failed, trying grpcweb..."
+              do_login_and_sync grpcweb; RC=$?
+            fi
+          else
+            do_login_and_sync direct; RC=$?
+            if [ $RC -ne 0 ]; then
+              echo "direct failed, trying grpcweb..."
+              do_login_and_sync grpcweb; RC=$?
+            fi
+          fi
+          set -e
+
+          if [ ${RC:-1} -ne 0 ]; then
+            echo "All Argo CD login modes failed (EOF/TLS/proxy mismatch suspected)."
+            exit $RC
