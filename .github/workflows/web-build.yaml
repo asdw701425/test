@@ -3,31 +3,37 @@ on:
   push:
     branches: [ "main" ]
     paths:
-      - "web-revised/**"                 # HTML/CSS/코드 변경 감지
-      - "apps/web-frontend/webapp.yaml"  # 수동 수정도 트리거
+      - "web-revised/**"
+      - "apps/web-frontend/webapp.yaml"
+
 permissions:
   contents: write
   packages: write
+
 concurrency:
   group: web-build
   cancel-in-progress: true
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     env:
       IMAGE: ghcr.io/unklo1200/web-updated
       TAG: v${{ github.run_number }}
+
     steps:
       - uses: actions/checkout@v4
+
       - name: Login to GHCR (unklo1200 namespace)
         run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u unklo1200 --password-stdin
+
       - name: Build & Push image
         run: |
           docker build -t $IMAGE:$TAG -f web-revised/Dockerfile web-revised
           docker push $IMAGE:$TAG
           DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE:$TAG)
           echo "DIGEST=$DIGEST" >> $GITHUB_ENV
-      # 매니페스트의 image 줄을 다이제스트로 고정 (재현성↑)
+
       - name: Update kubernetes manifest with new image
         run: |
           sed -i "s#image: .*web-updated.*#image: ${DIGEST}#g" apps/web-frontend/webapp.yaml
@@ -35,24 +41,27 @@ jobs:
           git config user.email "ci-bot@users.noreply.github.com"
           git commit -am "chore(web): deploy ${TAG} (${DIGEST})" || echo "no manifest change"
           git push
+
       # (선택) 바로 Argo CD 동기화
       - name: Argo CD sync (optional)
-        if: ${{ secrets.ARGOCD_SERVER != '' && secrets.ARGOCD_AUTH_TOKEN != '' }}
         env:
           ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
         run: |
           set -euo pipefail
-          # 시크릿 가드
-          test -n "$ARGOCD_SERVER" || (echo "ARGOCD_SERVER is empty"; exit 1)
-          test -n "$ARGOCD_AUTH_TOKEN" || (echo "ARGOCD_AUTH_TOKEN is empty"; exit 1)
-          echo "::add-mask::$ARGOCD_AUTH_TOKEN"
+          if [ -z "${ARGOCD_SERVER:-}" ] || [ -z "${ARGOCD_AUTH_TOKEN:-}" ]; then
+            echo "Skipping Argo CD sync: missing secrets"; exit 0
+          fi
+
+          # install argocd cli
           curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
           chmod +x /usr/local/bin/argocd
-          # 네트워크 확인(443 reachable)
+
+          # reachability check
           timeout 3 bash -c "cat < /dev/null > /dev/tcp/${ARGOCD_SERVER}/443" \
             && echo "443 reachable" || (echo "443 not reachable to $ARGOCD_SERVER"; exit 1)
-          # 토큰 로그인 & 동기화
+
+          # token login & sync
           argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web --insecure
           argocd account get-user-info
           argocd app sync web-frontend --grpc-web
