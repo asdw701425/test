@@ -84,8 +84,15 @@ jobs:
           DEST_NS: web
         run: |
           set -euo pipefail
+    # Assert secrets
+    test -n "${ARGOCD_SERVER}" || (echo "ARGOCD_SERVER is empty"; exit 1)
+    test -n "${ARGOCD_AUTH_TOKEN}" || (echo "ARGOCD_AUTH_TOKEN is empty"; exit 1)
+    echo "::add-mask::${ARGOCD_AUTH_TOKEN}"
+    # Network check
+    timeout 3 bash -c "cat < /dev/null > /dev/tcp/${ARGOCD_SERVER}/443" \
+      && echo "443 reachable" || (echo "443 not reachable to $ARGOCD_SERVER"; exit 1)
+
           argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web --insecure
-          argocd account get-user-info
           argocd account get-user-info
           if argocd app get "$APP_NAME" >/dev/null 2>&1; then
             echo "[INFO] $APP_NAME exists. Syncing..."
@@ -190,9 +197,15 @@ jobs:
           DEST_NS: was
         run: |
           set -euo pipefail
+    # Assert secrets
+    test -n "${ARGOCD_SERVER}" || (echo "ARGOCD_SERVER is empty"; exit 1)
+    test -n "${ARGOCD_AUTH_TOKEN}" || (echo "ARGOCD_AUTH_TOKEN is empty"; exit 1)
+    echo "::add-mask::${ARGOCD_AUTH_TOKEN}"
+    # Network check
+    timeout 3 bash -c "cat < /dev/null > /dev/tcp/${ARGOCD_SERVER}/443" \
+      && echo "443 reachable" || (echo "443 not reachable to $ARGOCD_SERVER"; exit 1)
+
           argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web --insecure
-          argocd account get-user-info
-          argocd account get-user-info
           if argocd app get "$APP_NAME" >/dev/null 2>&1; then
             echo "[INFO] $APP_NAME exists. Syncing..."
           else
