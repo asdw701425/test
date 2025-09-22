@@ -3,11 +3,11 @@ on:
   push:
     branches: [ "main" ]
     paths:
-      - 'web-revised/**'          # HTML/CSS/코드 변경 감지
-      - 'apps/web-frontend/webapp.yaml'  # 수동 수정도 트리거
+      - "web-revised/**"                 # HTML/CSS/코드 변경 감지
+      - "apps/web-frontend/webapp.yaml"  # 수동 수정도 트리거
 permissions:
-  contents: write     # 매니페스트 커밋을 위해 필요
-  packages: write     # GHCR 푸시를 위해 필요
+  contents: write
+  packages: write
 concurrency:
   group: web-build
   cancel-in-progress: true
@@ -35,15 +35,24 @@ jobs:
           git config user.email "ci-bot@users.noreply.github.com"
           git commit -am "chore(web): deploy ${TAG} (${DIGEST})" || echo "no manifest change"
           git push
- # (선택) 바로 Argo CD 동기화
+      # (선택) 바로 Argo CD 동기화
       - name: Argo CD sync (optional)
-        if: ${{ env.ARGOCD_SERVER != '' }}
+        if: ${{ secrets.ARGOCD_SERVER != '' && secrets.ARGOCD_AUTH_TOKEN != '' }}
         env:
-          ARGOCD_SERVER:   ${{ secrets.ARGOCD_SERVER }}
-  ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
         run: |
-          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-          chmod +x argocd && sudo mv argocd /usr/local/bin/argocd
+          set -euo pipefail
+          # 시크릿 가드
+          test -n "$ARGOCD_SERVER" || (echo "ARGOCD_SERVER is empty"; exit 1)
+          test -n "$ARGOCD_AUTH_TOKEN" || (echo "ARGOCD_AUTH_TOKEN is empty"; exit 1)
+          echo "::add-mask::$ARGOCD_AUTH_TOKEN"
+          curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+          # 네트워크 확인(443 reachable)
+          timeout 3 bash -c "cat < /dev/null > /dev/tcp/${ARGOCD_SERVER}/443" \
+            && echo "443 reachable" || (echo "443 not reachable to $ARGOCD_SERVER"; exit 1)
+          # 토큰 로그인 & 동기화
           argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web --insecure
           argocd account get-user-info
-          argocd app sync web-frontend
+          argocd app sync web-frontend --grpc-web
