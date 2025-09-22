@@ -10,138 +10,182 @@ on:
 
 permissions:
   contents: write
-  packages: write
 
 concurrency:
   group: build-deploy
   cancel-in-progress: true
 
-env:
-  IMAGE_WEB: ghcr.io/unklo1200/web-updated
-  IMAGE_WAS: ghcr.io/unklo1200/was-updated
-  TAG: v${{ github.run_number }}
-
 jobs:
-  deploy:
+  web-frontend:
+    if: github.actor != 'github-actions[bot]'   # 봇 커밋 재트리거 방지
     runs-on: ubuntu-latest
+    env:
+      CONTEXT_DIR: web-revised
+      MANIFEST_DIR: apps/web-frontend
+      IMAGE: ghcr.io/unklo1200/was-updated
+      TAG: v${{ github.run_number }}
+      ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+      ARGOCD_USERNAME: admin
+      ARGOCD_PASSWORD: ${{ secrets.ARGOCD_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check changes (web)
+        id: web_changed
+        run: |
+          if git diff --quiet HEAD^ HEAD -- "$CONTEXT_DIR" "$MANIFEST_DIR"; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
       - name: Login to GHCR
+        if: steps.web_changed.outputs.changed == 'true'
         run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u unklo1200 --password-stdin
 
-      - name: Detect changes (web & was)
-        id: ch
+      - name: Build & Push (web)
+        if: steps.web_changed.outputs.changed == 'true'
         run: |
-          set -euo pipefail
-          WEB_CHANGED=false
-          WAS_CHANGED=false
-          if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
-            git diff --quiet HEAD^ HEAD -- web-revised apps/web-frontend || WEB_CHANGED=true
-            git diff --quiet HEAD^ HEAD -- was         apps/was-api      || WAS_CHANGED=true
+          docker build -t $IMAGE:$TAG "$CONTEXT_DIR"
+          docker push $IMAGE:$TAG
+
+      - name: Install yq
+        if: steps.web_changed.outputs.changed == 'true'
+        run: |
+          sudo curl -L https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Update manifests image (web-frontend)
+        if: steps.web_changed.outputs.changed == 'true'
+        run: |
+          set -e
+          find "$MANIFEST_DIR" -type f \( -iname "*deploy*.y*ml" -o -iname "*deployment*.y*ml" \) -print0 \
+          | xargs -0 -I{} sh -c 'yq -i '"'"'(.spec.template.spec.containers[].image) = env(IMAGE) + ":" + env(TAG)'"'"' "{}"'
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -am "web-frontend: set image to $IMAGE:$TAG [skip ci]"
+            git push
           else
-            WEB_CHANGED=true
-            WAS_CHANGED=true
+            echo "No manifest changes to commit."
           fi
-          echo "web=${WEB_CHANGED}" >> "$GITHUB_OUTPUT"
-          echo "was=${WAS_CHANGED}" >> "$GITHUB_OUTPUT"
 
-      - name: Build & Push Web
-        if: steps.ch.outputs.web == 'true'
+      - name: ArgoCD Login & Sync (web-frontend)
+        if: steps.web_changed.outputs.changed == 'true' && env.ARGOCD_SERVER != ''
         run: |
-          set -euo pipefail
-          docker build -t ${IMAGE_WEB}:${TAG} -f web-revised/Dockerfile web-revised
-          docker push  ${IMAGE_WEB}:${TAG}
-          echo "DIGEST_WEB=$(docker inspect --format='{{index .RepoDigests 0}}' ${IMAGE_WEB}:${TAG})" >> "$GITHUB_ENV"
+          curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+          argocd login "$ARGOCD_SERVER" --username "$ARGOCD_USERNAME" --password "$ARGOCD_PASSWORD" --insecure --grpc-web
+          argocd app sync web-frontend --prune --grpc-web
+          argocd app wait web-frontend --health --sync
 
-      - name: Build & Push WAS
-        if: steps.ch.outputs.was == 'true'
-        run: |
-          set -euo pipefail
-          docker build -t ${IMAGE_WAS}:${TAG} -f was/Dockerfile was
-          docker push  ${IMAGE_WAS}:${TAG}
-          echo "DIGEST_WAS=$(docker inspect --format='{{index .RepoDigests 0}}' ${IMAGE_WAS}:${TAG})" >> "$GITHUB_ENV"
-
-      - name: Update manifests (web)
-        if: steps.ch.outputs.web == 'true'
-        run: |
-          set -euo pipefail
-          sed -i "s#image: .*web-updated.*#image: ${DIGEST_WEB}#g" apps/web-frontend/webapp.yaml
-          git config user.name "ci-bot"
-          git config user.email "ci-bot@users.noreply.github.com"
-          git commit -am "web: deploy ${TAG} (${DIGEST_WEB})" || echo "no manifest change"
-
-      - name: Update manifests (was)
-        if: steps.ch.outputs.was == 'true'
-        run: |
-          set -euo pipefail
-          sed -i "s#image: .*was-updated.*#image: ${DIGEST_WAS}#g" apps/was-api/wasapp.yaml
-          git config user.name "ci-bot"
-          git config user.email "ci-bot@users.noreply.github.com"
-          git commit -am "was: deploy ${TAG} (${DIGEST_WAS})" || echo "no manifest change"
-
-      - name: Push changes
-        if: steps.ch.outputs.web == 'true' || steps.ch.outputs.was == 'true'
-        run: git push
-
-      # ===== 공통: kubeconfig + 포트포워딩 동기화 =====
-      - name: Load kubeconfig
+      - name: Notify Slack (success)
+        if: steps.web_changed.outputs.changed == 'true' && success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          slack-message: |
+            ✅ *배포 성공 (web-frontend)*
+            • Image: `${{ env.IMAGE }}:${{ env.TAG }}`
+            • Ref: `${{ github.ref_name }}`
+            • Actor: `${{ github.actor }}`
         env:
-          KUBE_CONFIG_DATA: ${{ secrets.KUBE_CONFIG_DATA }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Notify Slack (failed)
+        if: steps.web_changed.outputs.changed == 'true' && failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          slack-message: |
+            ❌ *배포 실패 (web-frontend)*
+            • 로그: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  was-api:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    env:
+      CONTEXT_DIR: was                 # 트리거와 일치
+      MANIFEST_DIR: apps/was-api
+      IMAGE: ghcr.io/unklo1200/was-updated
+      TAG: v${{ github.run_number }}
+      ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+      ARGOCD_USERNAME: admin
+      ARGOCD_PASSWORD: ${{ secrets.ARGOCD_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check changes (was)
+        id: was_changed
         run: |
-          set -euo pipefail
-          mkdir -p "$HOME/.kube"
-          if printf '%s\n' "$KUBE_CONFIG_DATA" | head -n1 | grep -q '^apiVersion: v1'; then
-            printf '%s' "$KUBE_CONFIG_DATA" > "$HOME/.kube/config"
+          if git diff --quiet HEAD^ HEAD -- "$CONTEXT_DIR" "$MANIFEST_DIR"; then
+            echo "changed=false" >> $GITHUB_OUTPUT
           else
-            printf '%s' "$KUBE_CONFIG_DATA" | base64 -d > "$HOME/.kube/config"
+            echo "changed=true" >> $GITHUB_OUTPUT
           fi
-          chmod 600 "$HOME/.kube/config"
 
-      - name: Install tools
+      - name: Login to GHCR
+        if: steps.was_changed.outputs.changed == 'true'
+        run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u unklo1200 --password-stdin
+
+      - name: Build & Push (was)
+        if: steps.was_changed.outputs.changed == 'true'
         run: |
-          set -euo pipefail
-          if ! command -v kubectl >/dev/null 2>&1; then
-            curl -sLO https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
-            chmod +x kubectl && sudo mv kubectl /usr/local/bin/
-          fi
-          if ! command -v argocd >/dev/null 2>&1; then
-            curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-            chmod +x /usr/local/bin/argocd
+          docker build -t $IMAGE:$TAG "$CONTEXT_DIR"
+          docker push $IMAGE:$TAG
+
+      - name: Install yq
+        if: steps.was_changed.outputs.changed == 'true'
+        run: |
+          sudo curl -L https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Update manifests image (was-api)
+        if: steps.was_changed.outputs.changed == 'true'
+        run: |
+          set -e
+          find "$MANIFEST_DIR" -type f \( -iname "*deploy*.y*ml" -o -iname "*deployment*.y*ml" \) -print0 \
+          | xargs -0 -I{} sh -c 'yq -i '"'"'(.spec.template.spec.containers[].image) = env(IMAGE) + ":" + env(TAG)'"'"' "{}"'
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -am "was-api: set image to $IMAGE:$TAG [skip ci]"
+            git push
+          else
+            echo "No manifest changes to commit."
           fi
 
-      - name: ArgoCD Sync Web
-        if: steps.ch.outputs.web == 'true'
+      - name: ArgoCD Login & Sync (was-api)
+        if: steps.was_changed.outputs.changed == 'true' && env.ARGOCD_SERVER != ''
+        run: |
+          curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+          argocd login "$ARGOCD_SERVER" --username "$ARGOCD_USERNAME" --password "$ARGOCD_PASSWORD" --insecure --grpc-web
+          argocd app sync was-api --prune --grpc-web
+          argocd app wait was-api --health --sync
+
+      - name: Notify Slack (success)
+        if: steps.was_changed.outputs.changed == 'true' && success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          slack-message: |
+            ✅ *배포 성공 (was-api)*
+            • Image: `${{ env.IMAGE }}:${{ env.TAG }}`
+            • Ref: `${{ github.ref_name }}`
+            • Actor: `${{ github.actor }}`
         env:
-          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
-        run: |
-          set -euo pipefail
-          kubectl -n argocd port-forward svc/argocd-server 8443:443 >/tmp/argocd-pf-web.log 2>&1 &
-          PF_PID=$!
-          for i in {1..20}; do
-            curl -sk https://localhost:8443/ >/dev/null 2>&1 && break
-            sleep 0.5
-          done
-          echo "::add-mask::${ARGOCD_AUTH_TOKEN}"
-          argocd login "localhost:8443" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure
-          argocd app sync web-frontend --grpc-web --prune
-          argocd app wait web-frontend --health --timeout 300
-          kill $PF_PID || true
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
 
-      - name: ArgoCD Sync WAS
-        if: steps.ch.outputs.was == 'true'
+      - name: Notify Slack (failed)
+        if: steps.was_changed.outputs.changed == 'true' && failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          slack-message: |
+            ❌ *배포 실패 (was-api)*
+            • 로그: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         env:
-          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
-        run: |
-          set -euo pipefail
-          kubectl -n argocd port-forward svc/argocd-server 8444:443 >/tmp/argocd-pf-was.log 2>&1 &
-          PF_PID=$!
-          for i in {1..20}; do
-            curl -sk https://localhost:8444/ >/dev/null 2>&1 && break
-            sleep 0.5
-          done
-          echo "::add-mask::${ARGOCD_AUTH_TOKEN}"
-          argocd login "localhost:8444" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure
-          argocd app sync was-api --grpc-web --prune
-          argocd app wait was-api --health --timeout 300
-          kill $PF_PID || true
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}

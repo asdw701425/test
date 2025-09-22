@@ -3,17 +3,14 @@ on:
   push:
     branches: [ "main" ]
     paths:
-      - "web-revised/**"
-      - "apps/web-frontend/**"
-
+      - 'web-revised/**'          # HTML/CSS/코드 변경 감지
+      - 'apps/web-frontend/webapp.yaml'  # 수동 수정도 트리거
 permissions:
-  contents: write
-  packages: write
-
+  contents: write     # 매니페스트 커밋을 위해 필요
+  packages: write     # GHCR 푸시를 위해 필요
 concurrency:
   group: web-build
   cancel-in-progress: true
-
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
@@ -22,68 +19,31 @@ jobs:
       TAG: v${{ github.run_number }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Login to GHCR
+      - name: Login to GHCR (unklo1200 namespace)
         run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u unklo1200 --password-stdin
-
       - name: Build & Push image
         run: |
-          set -euo pipefail
           docker build -t $IMAGE:$TAG -f web-revised/Dockerfile web-revised
           docker push $IMAGE:$TAG
-          echo "DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE:$TAG)" >> "$GITHUB_ENV"
-
-      - name: Update manifests image (pin digest)
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE:$TAG)
+          echo "DIGEST=$DIGEST" >> $GITHUB_ENV
+      # 매니페스트의 image 줄을 다이제스트로 고정 (재현성↑)
+      - name: Update kubernetes manifest with new image
         run: |
-          set -euo pipefail
           sed -i "s#image: .*web-updated.*#image: ${DIGEST}#g" apps/web-frontend/webapp.yaml
           git config user.name "ci-bot"
           git config user.email "ci-bot@users.noreply.github.com"
-          git commit -am "web: deploy ${TAG} (${DIGEST})" || echo "no manifest change"
+          git commit -am "chore(web): deploy ${TAG} (${DIGEST})" || echo "no manifest change"
           git push
-
-      # ===== Argo CD Sync via port-forward (TLS SAN=localhost) =====
-      - name: Load kubeconfig
+ # (선택) 바로 Argo CD 동기화
+      - name: Argo CD sync (optional)
+        if: ${{ env.ARGOCD_SERVER != '' }}
         env:
-          KUBE_CONFIG_DATA: ${{ secrets.KUBE_CONFIG_DATA }}  # base64 또는 원문 YAML 둘 다 OK
+          ARGOCD_SERVER:   ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_USERNAME: ${{ secrets.ARGOCD_USERNAME }}
+          ARGOCD_PASSWORD: ${{ secrets.ARGOCD_PASSWORD }}
         run: |
-          set -euo pipefail
-          mkdir -p "$HOME/.kube"
-          if printf '%s\n' "$KUBE_CONFIG_DATA" | head -n1 | grep -q '^apiVersion: v1'; then
-            printf '%s' "$KUBE_CONFIG_DATA" > "$HOME/.kube/config"
-          else
-            printf '%s' "$KUBE_CONFIG_DATA" | base64 -d > "$HOME/.kube/config"
-          fi
-          chmod 600 "$HOME/.kube/config"
-
-      - name: Argo CD sync (via port-forward)
-        env:
-          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
-          APP_NAME: web-frontend
-        run: |
-          set -euo pipefail
-          if ! command -v kubectl >/dev/null 2>&1; then
-            curl -sLO https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
-            chmod +x kubectl && sudo mv kubectl /usr/local/bin/
-          fi
-          if ! command -v argocd >/dev/null 2>&1; then
-            curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-            chmod +x /usr/local/bin/argocd
-          fi
-
-          # port-forward (svc/argocd-server -> localhost:8443)
-          kubectl -n argocd get svc argocd-server >/dev/null
-          kubectl -n argocd port-forward svc/argocd-server 8443:443 >/tmp/argocd-pf.log 2>&1 &
-          PF_PID=$!
-          for i in {1..20}; do
-            curl -sk https://localhost:8443/ >/dev/null 2>&1 && break
-            sleep 0.5
-          done
-
-          test -n "${ARGOCD_AUTH_TOKEN:-}" || { echo "ARGOCD_AUTH_TOKEN missing"; kill $PF_PID || true; exit 1; }
-          echo "::add-mask::${ARGOCD_AUTH_TOKEN}"
-          argocd login "localhost:8443" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure
-          argocd account get-user-info
-          argocd app sync "$APP_NAME" --grpc-web --prune
-          argocd app wait "$APP_NAME" --health --timeout 300
-          kill $PF_PID || true
+          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x argocd && sudo mv argocd /usr/local/bin/argocd
+          argocd login "${ARGOCD_SERVER}" --username "${ARGOCD_USERNAME}" --password "${ARGOCD_PASSWORD}" --insecure --grpc-web
+          argocd app sync web-frontend

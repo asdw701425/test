@@ -5,7 +5,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: was-secrets
-  namespace: was
+  namespace: appnet
 type: Opaque
 stringData:
   DB_USER: "awslearner"
@@ -22,7 +22,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: was-config
-  namespace: was
+  namespace: appnet
 data:
   DB_HOST: "test.c0feiu04cr8o.us-east-1.rds.amazonaws.com"
   DB_PORT: "3306"
@@ -45,7 +45,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: was-api
-  namespace: was
+  namespace: appnet
   annotations:
     # eks.amazonaws.com/role-arn: arn:aws:iam::<ACCOUNT_ID>:role/<ROLE_NAME>
 automountServiceAccountToken: true
@@ -58,7 +58,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: was-api
-  namespace: was
+  namespace: appnet
   labels:
     app: was-api
 spec:
@@ -93,7 +93,7 @@ spec:
       containers:
         - name: was-api
           image: ghcr.io/unklo1200/was-updated:v12
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 8000
@@ -120,7 +120,7 @@ spec:
             - name: TMPDIR
               value: "/tmp"
             - name: GUNICORN_CMD_ARGS
-              value: "--bind 0.0.0.0:8000 --workers 2 --threads 4 --timeout 60 --graceful-timeout 30 --keep-alive 2 --worker-tmp-dir /tmp"
+              value: "--worker-tmp-dir /tmp"
 
           volumeMounts:
             - name: tmp
@@ -139,14 +139,14 @@ spec:
               exec:
                 command: ["/bin/sh","-c","sleep 5"]
 
-          # Start/Ready/Live Probes (timeout 5초로 완화)
+          # Start/Ready/Live Probes
           startupProbe:
             httpGet:
               path: /health
               port: 8000
             failureThreshold: 60
             periodSeconds: 2
-            timeoutSeconds: 5
+            timeoutSeconds: 2
 
           readinessProbe:
             httpGet:
@@ -154,7 +154,7 @@ spec:
               port: 8000
             initialDelaySeconds: 3
             periodSeconds: 5
-            timeoutSeconds: 5
+            timeoutSeconds: 2
             failureThreshold: 6
 
           livenessProbe:
@@ -163,7 +163,7 @@ spec:
               port: 8000
             initialDelaySeconds: 10
             periodSeconds: 10
-            timeoutSeconds: 5
+            timeoutSeconds: 2
             failureThreshold: 5
 
           securityContext:
@@ -178,7 +178,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: was
-  namespace: was
+  namespace: appnet
 spec:
   type: ClusterIP
   selector:
@@ -196,7 +196,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: was-api-nlb
-  namespace: was
+  namespace: appnet
   annotations:
     service.beta.kubernetes.io/aws-load-balancer-type: "nlb"               # NLB
     service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"     # Pod IP 타깃
