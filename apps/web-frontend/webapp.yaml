@@ -98,10 +98,10 @@ spec:
       containers:
         - name: web
 <<<<<<< HEAD
-          image: ghcr.io/unklo1200/web-updated@sha256:28ebd0763613494f2441947e2fc56e86bc4314a4b7572e9fd66c1bd33c039c32
+          image: ghcr.io/unklo1200/web-updated@sha256:94c9af69c71ec3db74b9ee5dd17c9426047db32a6f2a4b36ac4ffeda4a58a1d4
           imagePullPolicy: IfNotPresent
 =======
-          image: ghcr.io/unklo1200/web-updated@sha256:28ebd0763613494f2441947e2fc56e86bc4314a4b7572e9fd66c1bd33c039c32
+          image: ghcr.io/unklo1200/web-updated@sha256:94c9af69c71ec3db74b9ee5dd17c9426047db32a6f2a4b36ac4ffeda4a58a1d4
           imagePullPolicy: Always
 >>>>>>> 908ea587a70adea82ada4113f4b4143c1050c530
           ports:
