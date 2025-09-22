@@ -1,21 +1,21 @@
-name: web-build
+name: was-build
 on:
   push:
     branches: [ "main" ]
     paths:
-      - 'web-revised/**'          # HTML/CSS/코드 변경 감지
-      - 'apps/web-frontend/webapp.yaml'  # 수동 수정도 트리거
+      - 'was/**'          # HTML/CSS/코드 변경 감지
+      - 'apps/was-api/wasapp.yaml'  # 수동 수정도 트리거
 permissions:
   contents: write     # 매니페스트 커밋을 위해 필요
   packages: write     # GHCR 푸시를 위해 필요
 concurrency:
-  group: web-build
+  group: was-build
   cancel-in-progress: true
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     env:
-      IMAGE: ghcr.io/unklo1200/web-updated
+      IMAGE: ghcr.io/unklo1200/was-updated
       TAG: v${{ github.run_number }}
     steps:
       - uses: actions/checkout@v4
@@ -23,27 +23,27 @@ jobs:
         run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u unklo1200 --password-stdin
       - name: Build & Push image
         run: |
-          docker build -t $IMAGE:$TAG -f web-revised/Dockerfile web-revised
+          docker build -t $IMAGE:$TAG -f was/Dockerfile was
           docker push $IMAGE:$TAG
           DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE:$TAG)
           echo "DIGEST=$DIGEST" >> $GITHUB_ENV
       # 매니페스트의 image 줄을 다이제스트로 고정 (재현성↑)
       - name: Update kubernetes manifest with new image
         run: |
-          sed -i "s#image: .*web-updated.*#image: ${DIGEST}#g" apps/web-frontend/webapp.yaml
+          sed -i "s#image: .*was-updated.*#image: ${DIGEST}#g" apps/was-api/wasapp.yaml
           git config user.name "ci-bot"
           git config user.email "ci-bot@users.noreply.github.com"
           git commit -am "chore(web): deploy ${TAG} (${DIGEST})" || echo "no manifest change"
           git push
- # (선택) 바로 Argo CD 동기화
+     # (선택) 바로 Argo CD 동기화
       - name: Argo CD sync (optional)
         if: ${{ env.ARGOCD_SERVER != '' }}
         env:
           ARGOCD_SERVER:   ${{ secrets.ARGOCD_SERVER }}
-          ARGOCD_USERNAME: ${{ secrets.ARGOCD_USERNAME }}
-          ARGOCD_PASSWORD: ${{ secrets.ARGOCD_PASSWORD }}
+  ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
         run: |
           curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
           chmod +x argocd && sudo mv argocd /usr/local/bin/argocd
-          argocd login "${ARGOCD_SERVER}" --username "${ARGOCD_USERNAME}" --password "${ARGOCD_PASSWORD}" --insecure --grpc-web
-          argocd app sync web-frontend
+          argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web --insecure
+          argocd account get-user-info
+          argocd app sync was-api

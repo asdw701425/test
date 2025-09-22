@@ -86,6 +86,7 @@ jobs:
           set -euo pipefail
           argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web --insecure
           argocd account get-user-info
+          argocd account get-user-info
           if argocd app get "$APP_NAME" >/dev/null 2>&1; then
             echo "[INFO] $APP_NAME exists. Syncing..."
           else
@@ -190,6 +191,7 @@ jobs:
         run: |
           set -euo pipefail
           argocd login "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web --insecure
+          argocd account get-user-info
           argocd account get-user-info
           if argocd app get "$APP_NAME" >/dev/null 2>&1; then
             echo "[INFO] $APP_NAME exists. Syncing..."
