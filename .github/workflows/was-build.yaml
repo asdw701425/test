@@ -4,7 +4,7 @@ on:
     branches: [ "main" ]
     paths:
       - "was/**"
-      - "apps/was-api/wasapp.yaml"
+      - "apps/was-api/**"
 
 permissions:
   contents: write
@@ -20,7 +20,6 @@ jobs:
     env:
       IMAGE: ghcr.io/unklo1200/was-updated
       TAG: v${{ github.run_number }}
-
     steps:
       - uses: actions/checkout@v4
 
@@ -32,36 +31,58 @@ jobs:
           set -euo pipefail
           docker build -t $IMAGE:$TAG -f was/Dockerfile was
           docker push $IMAGE:$TAG
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE:$TAG)
-          echo "DIGEST=$DIGEST" >> $GITHUB_ENV
+          echo "DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE:$TAG)" >> "$GITHUB_ENV"
 
-      - name: Update manifest image
+      - name: Update manifests image (pin digest)
         run: |
+          set -euo pipefail
           sed -i "s#image: .*was-updated.*#image: ${DIGEST}#g" apps/was-api/wasapp.yaml
           git config user.name "ci-bot"
           git config user.email "ci-bot@users.noreply.github.com"
-          git commit -am "chore(was): deploy ${TAG} (${DIGEST})" || echo "no manifest change"
+          git commit -am "was: deploy ${TAG} (${DIGEST})" || echo "no manifest change"
           git push
 
-      - name: Argo CD sync (port-forward)
+      # ===== Argo CD Sync via port-forward (TLS SAN=localhost) =====
+      - name: Load kubeconfig
         env:
           KUBE_CONFIG_DATA: ${{ secrets.KUBE_CONFIG_DATA }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.kube"
+          if printf '%s\n' "$KUBE_CONFIG_DATA" | head -n1 | grep -q '^apiVersion: v1'; then
+            printf '%s' "$KUBE_CONFIG_DATA" > "$HOME/.kube/config"
+          else
+            printf '%s' "$KUBE_CONFIG_DATA" | base64 -d > "$HOME/.kube/config"
+          fi
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Argo CD sync (via port-forward)
+        env:
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
           APP_NAME: was-api
         run: |
           set -euo pipefail
-          echo "::add-mask::${ARGOCD_AUTH_TOKEN}"
-          echo "$KUBE_CONFIG_DATA" | base64 -d > "$HOME/.kube/config"
-          chmod 600 "$HOME/.kube/config"
+          if ! command -v kubectl >/dev/null 2>&1; then
+            curl -sLO https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
+            chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          fi
+          if ! command -v argocd >/dev/null 2>&1; then
+            curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+            chmod +x /usr/local/bin/argocd
+          fi
 
-          curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-          chmod +x /usr/local/bin/argocd
-
-          kubectl -n argocd port-forward svc/argocd-server 8443:443 >/tmp/pf.log 2>&1 &
+          kubectl -n argocd get svc argocd-server >/dev/null
+          kubectl -n argocd port-forward svc/argocd-server 8443:443 >/tmp/argocd-pf.log 2>&1 &
           PF_PID=$!
-          for i in {1..20}; do curl -sk https://localhost:8443 && break || sleep 1; done
+          for i in {1..20}; do
+            curl -sk https://localhost:8443/ >/dev/null 2>&1 && break
+            sleep 0.5
+          done
 
-          argocd login localhost:8443 --auth-token "$ARGOCD_AUTH_TOKEN" --insecure
+          test -n "${ARGOCD_AUTH_TOKEN:-}" || { echo "ARGOCD_AUTH_TOKEN missing"; kill $PF_PID || true; exit 1; }
+          echo "::add-mask::${ARGOCD_AUTH_TOKEN}"
+          argocd login "localhost:8443" --auth-token "$ARGOCD_AUTH_TOKEN" --insecure
+          argocd account get-user-info
           argocd app sync "$APP_NAME" --grpc-web --prune
           argocd app wait "$APP_NAME" --health --timeout 300
           kill $PF_PID || true
