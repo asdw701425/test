@@ -1,0 +1,24 @@
+ip -a 
+nmtui (172.132.20.10/24, on)
+vi /etc/selinux/config --disabled
+systemctl status firewalld
+systemctl stop firewalld
+systemctl disable firewalld
+reboot
+(dnf localinstall *.rpm
+reboot)
+
+mkdir -p /etc/.setup
+
+ssh root@192.168.0.250
+2023gksdnf@)@#
+cd /PXE/ftp/R9
+scp KIT_260320.el9.tar.gz* root@192.168.0.66:/etc/.setup
+exit
+
+
+cat KIT_260320.el9.tar.gz* | tar zxvf -
+#0 1 7 3
+
+cd /files/OMSA
+tar zxvf OMSA-11.1.0.0.el9.tar.gz
